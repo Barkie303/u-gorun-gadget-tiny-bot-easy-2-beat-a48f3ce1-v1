@@ -88,11 +88,26 @@ function exits(state: BarsState, symbol: string, held: { qty: bigint; cost: bigi
   return value * ROI_DEN >= held.cost * ROI_NUM || value * STOP_DEN <= held.cost * STOP_NUM;
 }
 
+interface Trade {
+  symbol: string;
+  side: 'buy' | 'sell';
+  bar: number;
+}
+
+const journal: Trade[] = [];
+let barsSeen = 0;
+let peakEquity = 0n;
+let worstDrawdownBps = 0n;
+
 await runBars({
   onBatch(state, batch) {
     const signals = new Map<string, Signal>();
     for (const bar of batch.bars) signals.set(bar.symbol, push(bar));
     if (state.warmingUp) return [];
+    barsSeen++;
+    if (state.equity > peakEquity) peakEquity = state.equity;
+    const drop = peakEquity > 0n ? ((peakEquity - state.equity) * 10000n) / peakEquity : 0n;
+    if (drop > worstDrawdownBps) worstDrawdownBps = drop;
     const { caps, fees } = state.hello;
     const sells: SellInput[] = [];
     const entries: string[] = [];
@@ -100,7 +115,10 @@ await runBars({
       if (!signals.has(symbol)) continue;
       const held = state.positions.get(symbol);
       if (held !== undefined) {
-        if (exits(state, symbol, held, signals.get(symbol) ?? null)) sells.push({ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
+        if (exits(state, symbol, held, signals.get(symbol) ?? null)) {
+          sells.push({ side: 'sell', symbol, qty: held.qty, max_slippage_bps: MAX_SLIPPAGE_BPS });
+          journal.push({ symbol, side: 'sell', bar: barsSeen });
+        }
       } else if (signals.get(symbol) === 'up') entries.push(symbol);
     }
     const orders: (SellInput | BuyInput)[] = sells.slice(0, caps.max_orders_per_bar);
@@ -115,6 +133,7 @@ await runBars({
       if (cash < slice) slice = cash;
       if (slice === 0n || slice < BigInt(fees.min_notional_quote_units)) break;
       orders.push({ side: 'buy', symbol, notional_quote_units: slice, max_slippage_bps: MAX_SLIPPAGE_BPS });
+      journal.push({ symbol, side: 'buy', bar: barsSeen });
       cash -= slice;
       room--;
     }
